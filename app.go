@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -25,12 +26,14 @@ func (e *PromiseError) Error() string {
 	return fmt.Sprintf("PromiseError: %s", e.Object.String())
 }
 
-func WaitForPromise(promise *js.Object) (*js.Object, error) {
+func WaitForPromise(ctx context.Context, promise *js.Object) (*js.Object, error) {
 	errChan := make(chan *js.Object, 1)
 	resChan := make(chan *js.Object, 1)
 	promise.Call("then", func(res *js.Object) { resChan <- res })
 	promise.Call("catch", func(err *js.Object) { errChan <- err })
 	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case res := <-resChan:
 		return res, nil
 	case err := <-errChan:
@@ -67,6 +70,10 @@ var (
 	}
 
 	adaptedConstraints map[string]interface{}
+
+	ErrPeerConnectionClosed = errors.New("PeerConnection is closed")
+	ErrDataChannelClosed    = errors.New("DataChannel is closed")
+	ErrDataChannelTriggered = errors.New("DataChannel event triggered")
 )
 
 const (
@@ -74,6 +81,7 @@ const (
 	highWaterMark = 4 * 1024 * 1024
 	lowWaterMark  = 128 * 1024
 	pollTimeout   = time.Millisecond * 250
+	dataChannelID = 1
 )
 
 func init() {
@@ -82,6 +90,19 @@ func init() {
 	} else {
 		adaptedConstraints = chromeConstraints
 	}
+}
+
+////////////////////////////////////////////////////////////////////////
+//////////////////////////////// Signaller /////////////////////////////
+////////////////////////////////////////////////////////////////////////
+
+type Signaller interface {
+	PushOffer(context.Context, interface{}) error
+	PullOffer(context.Context) (interface{}, error)
+	PushAnswer(context.Context, interface{}) error
+	PullAnswer(context.Context) (interface{}, error)
+	PushICECandidate(context.Context, interface{}) error
+	PullICECandidate(context.Context) (interface{}, error)
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -117,17 +138,98 @@ const (
 
 type DataChannel struct {
 	*js.Object
-	peerConnection *PeerConnection
 
-	Label                      string     `js:"label"`
-	Ordered                    bool       `js:"ordered"`
-	Protocol                   string     `js:"protocol"`
-	ID                         uint16     `js:"id"`
-	ReadyState                 ReadyState `js:"readyState"`
-	BufferedAmount             uint32     `js:"bufferedAmount"`
-	Negotiated                 bool       `js:"negotiated"`
-	BinaryType                 string     `js:"binaryType"`
-	BufferedAmountLowThreshold uint32     `js:bufferedAmountLowThreshold"`
+	Label          string     `js:"label"`
+	Ordered        bool       `js:"ordered"`
+	Protocol       string     `js:"protocol"`
+	ID             uint16     `js:"id"`
+	ReadyState     ReadyState `js:"readyState"`
+	BufferedAmount uint32     `js:"bufferedAmount"`
+	Negotiated     bool       `js:"negotiated"`
+	BinaryType     string     `js:"binaryType"`
+
+	// Channels
+	closedChan chan struct{}
+
+	// Live cycle
+	closedMtx sync.Mutex
+	closed    bool
+
+	// Reading
+	readBuffer bytes.Buffer
+	readMtx    sync.Mutex
+	readCond   *sync.Cond
+}
+
+func newDataChannel(dataChannelObject *js.Object) *DataChannel {
+	dataChannel := &DataChannel{
+		Object:     dataChannelObject,
+		closedChan: make(chan struct{}),
+	}
+	dataChannel.readCond = sync.NewCond(&dataChannel.readMtx)
+	dataChannel.BinaryType = "arraybuffer"
+
+	////////////////////////////////////////////////////////////////////////
+	//////////////////////////////// Link events ///////////////////////////
+	////////////////////////////////////////////////////////////////////////
+
+	go func() {
+		// Wait for data channel to close
+		<-dataChannel.Closed()
+
+		// Make sure to wake up waiting readers
+		dataChannel.readMtx.Lock()
+		dataChannel.readCond.Broadcast()
+		dataChannel.readCond = nil
+		dataChannel.readMtx.Unlock()
+	}()
+
+	go func() {
+		// Wait for data channel to close
+		<-dataChannel.Closed()
+
+		// Panic on javascript errors
+		defer func() {
+			e := recover()
+			if e == nil {
+				return
+			}
+			if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
+				log.Printf("DataChannel failed during closing due to error (%v)", jsErr)
+			} else {
+				panic(e)
+			}
+		}()
+
+		// Finally close the underlying data channel object
+		dataChannel.Object.Call("close")
+
+		return
+	}()
+
+	dataChannel.AddEventListener("open", false, func(evt *js.Object) {
+		log.Print("DataChannel is open")
+	})
+
+	dataChannel.AddEventListener("error", false, func(evt *js.Object) {
+		log.Printf("DataChannel failed due to error (%v)", evt)
+		dataChannel.Close()
+	})
+
+	dataChannel.AddEventListener("close", false, func(evt *js.Object) {
+		dataChannel.Close()
+	})
+
+	dataChannel.AddEventListener("message", false, func(evt *js.Object) {
+		data := js.Global.Get("Uint8Array").New(evt.Get("data")).Interface().([]byte)
+
+		dataChannel.readMtx.Lock()
+		defer dataChannel.readMtx.Unlock()
+		dataChannel.readBuffer.Write(data)
+		dataChannel.readCond.Broadcast()
+	})
+
+	return dataChannel
 }
 
 func (c *DataChannel) AddEventListener(typ string, useCapture bool, listener func(*js.Object)) {
@@ -156,22 +258,70 @@ func (c *DataChannel) Send(data interface{}) (err error) {
 	return
 }
 
-func (c *DataChannel) Close() (err error) {
-	defer func() {
-		e := recover()
-		if e == nil {
-			return
+func (c *DataChannel) Write(b []byte) (int, error) {
+	totalSize := len(b)
+	var chunk []byte
+	for rem := totalSize; rem > 0; {
+		size := rem
+		if size > chunkSize {
+			size = chunkSize
 		}
-		if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
-			err = jsErr
-		} else {
-			panic(e)
+
+		chunk, b = b[:size], b[size:]
+
+		if err := c.Send(chunk); err != nil {
+			return totalSize - rem, err
 		}
-	}()
 
-	c.Object.Call("close")
+		if c.BufferedAmount > highWaterMark {
+			for c.BufferedAmount > lowWaterMark {
+				time.Sleep(pollTimeout)
+			}
+		}
 
-	return
+		rem -= size
+	}
+
+	return totalSize, nil
+}
+
+func (c *DataChannel) Read(b []byte) (int, error) {
+	c.readMtx.Lock()
+	defer c.readMtx.Unlock()
+
+	// Check if there is something to read
+	for c.readBuffer.Len() == 0 {
+
+		// Check if data channel is closed (if readCond is nil...)
+		if c.readCond == nil {
+			return 0, ErrDataChannelClosed
+		}
+
+		// Wait for read condition
+		c.readCond.Wait()
+	}
+
+	// Read from buffer and return result
+	return c.readBuffer.Read(b)
+}
+
+func (c *DataChannel) Closed() <-chan struct{} {
+	return c.closedChan
+}
+
+func (c *DataChannel) Close() error {
+	c.closedMtx.Lock()
+
+	if c.closed {
+		c.closedMtx.Unlock()
+		return nil
+	}
+
+	c.closed = true
+	c.closedMtx.Unlock()
+
+	close(c.closedChan)
+	return nil
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -180,27 +330,208 @@ func (c *DataChannel) Close() (err error) {
 
 type PeerConnection struct {
 	*js.Object
+	DataChannel *DataChannel
+
+	SignalingState string `js:"signalingState"`
+
+	// Channels
+	closedChan chan struct{}
+
+	// Live cycle
+	closedMtx sync.Mutex
+	closed    bool
 }
 
-func NewPeerConnection() (pc *PeerConnection, err error) {
+func newPeerConnection(ctx context.Context, dial bool, signaller Signaller) (peerConnection *PeerConnection, err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
 			return
 		}
 		if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
-			pc = nil
+			peerConnection = nil
 			err = jsErr
 		} else {
 			panic(e)
 		}
 	}()
 
-	pc = &PeerConnection{
-		js.Global.Get("window").Get("RTCPeerConnection").New(peerConnectionConfig),
+	// Derive new context
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Create peer connection object
+	peerConnectionObject := js.Global.Get("window").Get("RTCPeerConnection").New(peerConnectionConfig)
+
+	// Create data channel
+	dataChannel := newDataChannel(peerConnectionObject.Call("createDataChannel", "main", map[string]interface{}{
+		"ordered":    true,
+		"negotiated": true,
+		"id":         dataChannelID,
+	}))
+
+	// Create peer connection
+	peerConnection = &PeerConnection{
+		Object:      peerConnectionObject,
+		DataChannel: dataChannel,
+		closedChan:  make(chan struct{}),
 	}
 
-	return
+	////////////////////////////////////////////////////////////////////////
+	//////////////////////////////// Link events ///////////////////////////
+	////////////////////////////////////////////////////////////////////////
+
+	go func() {
+		// Wait for peer connection to close
+		<-peerConnection.Closed()
+
+		// Panic on javascript errors
+		defer func() {
+			e := recover()
+			if e == nil {
+				return
+			}
+			if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
+				log.Printf("PeerConnection failed during closing due to error (%v)", jsErr)
+			} else {
+				panic(e)
+			}
+		}()
+
+		// Finally close the underlying peer connection object
+		if peerConnection.SignalingState != "closed" {
+			peerConnection.Object.Call("close")
+		}
+
+		// Also close the data channel
+		peerConnection.DataChannel.Close()
+	}()
+
+	go func() {
+		// Wait for data channel to close
+		<-peerConnection.DataChannel.Closed()
+
+		// Also close the peer connection
+		peerConnection.Close()
+
+		return
+	}()
+
+	peerConnection.AddEventListener("datachannel", false, func(evt *js.Object) {
+		log.Printf("PeerConnection failed due to error (%v)", ErrDataChannelTriggered)
+		peerConnection.Close()
+	})
+
+	go func() {
+		defer peerConnection.Close()
+		<-ctx.Done()
+	}()
+
+	go func() {
+		defer cancel()
+		<-peerConnection.Closed()
+	}()
+
+	////////////////////////////////////////////////////////////////////////
+	//////////////////////////////// Dialing ///////////////////////////////
+	////////////////////////////////////////////////////////////////////////
+
+	// Close if data channel is open
+	openChan := make(chan struct{})
+	dataChannel.AddEventListener("open", false, func(evt *js.Object) {
+		close(openChan)
+	})
+
+	// Listen for ice candidate and push to remote
+	peerConnection.AddEventListener("icecandidate", false, func(evt *js.Object) {
+		iceCandidate := evt.Get("candidate")
+		if iceCandidate == nil {
+			return
+		}
+
+		go func() {
+			if err := signaller.PushICECandidate(ctx, iceCandidate); err != nil {
+				log.Printf("PeerConnection failed to push ice candidate due to error (%v)", err)
+				peerConnection.Close()
+			}
+		}()
+	})
+
+	// Dial or listen
+	if dial {
+		offer, err := peerConnection.CreateOffer(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := signaller.PushOffer(ctx, offer); err != nil {
+			return nil, err
+		}
+
+		answer, err := signaller.PullAnswer(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := peerConnection.AcceptAnswer(ctx, answer); err != nil {
+			return nil, err
+		}
+	} else {
+		offer, err := signaller.PullOffer(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		answer, err := peerConnection.AcceptOfferAndCreateAnswer(ctx, offer)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := signaller.PushAnswer(ctx, answer); err != nil {
+			return nil, err
+		}
+	}
+
+	ctxICE, cancelICE := context.WithCancel(ctx)
+	go func() {
+		defer cancelICE()
+		select {
+		case <-openChan:
+		case <-peerConnection.Closed():
+		}
+	}()
+
+	go func() {
+
+		for {
+			iceCandidate, err := signaller.PullICECandidate(ctxICE)
+			if err != nil {
+				log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
+				return
+			}
+
+			if err := peerConnection.AddICECandidate(ctx, iceCandidate); err != nil {
+				log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
+				peerConnection.Close()
+				return
+			}
+		}
+	}()
+
+	// Make sure to wait for open / close
+	select {
+	case <-peerConnection.Closed():
+		return nil, ErrPeerConnectionClosed
+	case <-openChan:
+		return
+	}
+}
+
+func DialPeerConnection(ctx context.Context, signaller Signaller) (peerConnection *PeerConnection, err error) {
+	return newPeerConnection(ctx, true, signaller)
+}
+
+func ListenPeerConnection(ctx context.Context, signaller Signaller) (peerConnection *PeerConnection, err error) {
+	return newPeerConnection(ctx, false, signaller)
 }
 
 func (c *PeerConnection) AddEventListener(typ string, useCapture bool, listener func(*js.Object)) {
@@ -211,37 +542,7 @@ func (c *PeerConnection) RemoveEventListener(typ string, useCapture bool, listen
 	c.Object.Call("removeEventListener", typ, listener, useCapture)
 }
 
-func (c *PeerConnection) CreateDataChannel() (dc *DataChannel, err error) {
-	defer func() {
-		e := recover()
-		if e == nil {
-			return
-		}
-		if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
-			dc = nil
-			err = jsErr
-		} else {
-			panic(e)
-		}
-	}()
-
-	object := c.Object.Call("createDataChannel", "main", map[string]interface{}{
-		"ordered":    true,
-		"negotiated": true,
-		"id":         1,
-	})
-
-	dc = &DataChannel{
-		Object:         object,
-		peerConnection: c,
-	}
-
-	dc.BinaryType = "arraybuffer"
-
-	return
-}
-
-func (c *PeerConnection) CreateOffer() (object *js.Object, err error) {
+func (c *PeerConnection) CreateOffer(ctx context.Context) (object interface{}, err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -255,12 +556,12 @@ func (c *PeerConnection) CreateOffer() (object *js.Object, err error) {
 		}
 	}()
 
-	object, err = WaitForPromise(c.Object.Call("createOffer", adaptedConstraints))
+	object, err = WaitForPromise(ctx, c.Object.Call("createOffer", adaptedConstraints))
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = WaitForPromise(c.Object.Call("setLocalDescription", object))
+	_, err = WaitForPromise(ctx, c.Object.Call("setLocalDescription", object))
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +569,7 @@ func (c *PeerConnection) CreateOffer() (object *js.Object, err error) {
 	return
 }
 
-func (c *PeerConnection) AcceptOfferAndCreateAnswer(offer *js.Object) (object *js.Object, err error) {
+func (c *PeerConnection) AcceptOfferAndCreateAnswer(ctx context.Context, offer interface{}) (object interface{}, err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -283,17 +584,17 @@ func (c *PeerConnection) AcceptOfferAndCreateAnswer(offer *js.Object) (object *j
 	}()
 
 	rtcSessionDescription := js.Global.Get("window").Get("RTCSessionDescription").New(offer)
-	_, err = WaitForPromise(c.Object.Call("setRemoteDescription", rtcSessionDescription))
+	_, err = WaitForPromise(ctx, c.Object.Call("setRemoteDescription", rtcSessionDescription))
 	if err != nil {
 		return nil, err
 	}
 
-	object, err = WaitForPromise(c.Object.Call("createAnswer", adaptedConstraints))
+	object, err = WaitForPromise(ctx, c.Object.Call("createAnswer", adaptedConstraints))
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = WaitForPromise(c.Object.Call("setLocalDescription", object))
+	_, err = WaitForPromise(ctx, c.Object.Call("setLocalDescription", object))
 	if err != nil {
 		return nil, err
 	}
@@ -301,7 +602,7 @@ func (c *PeerConnection) AcceptOfferAndCreateAnswer(offer *js.Object) (object *j
 	return
 }
 
-func (c *PeerConnection) AcceptAnswer(answer *js.Object) (err error) {
+func (c *PeerConnection) AcceptAnswer(ctx context.Context, answer interface{}) (err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -315,12 +616,12 @@ func (c *PeerConnection) AcceptAnswer(answer *js.Object) (err error) {
 	}()
 
 	rtcSessionDescription := js.Global.Get("window").Get("RTCSessionDescription").New(answer)
-	_, err = WaitForPromise(c.Object.Call("setRemoteDescription", rtcSessionDescription))
+	_, err = WaitForPromise(ctx, c.Object.Call("setRemoteDescription", rtcSessionDescription))
 
 	return
 }
 
-func (c *PeerConnection) AddICECandidate(iceCandidate *js.Object) (err error) {
+func (c *PeerConnection) AddICECandidate(ctx context.Context, iceCandidate interface{}) (err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -334,127 +635,100 @@ func (c *PeerConnection) AddICECandidate(iceCandidate *js.Object) (err error) {
 	}()
 
 	rtcICECandidate := js.Global.Get("window").Get("RTCIceCandidate").New(iceCandidate)
-	_, err = WaitForPromise(c.Object.Call("addIceCandidate", rtcICECandidate))
+	_, err = WaitForPromise(ctx, c.Object.Call("addIceCandidate", rtcICECandidate))
 
 	return
 }
 
-func (c *PeerConnection) Close() (err error) {
-	defer func() {
-		e := recover()
-		if e == nil {
-			return
-		}
-		if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
-			err = jsErr
-		} else {
-			panic(e)
-		}
-	}()
+func (c *PeerConnection) Closed() <-chan struct{} {
+	return c.closedChan
+}
 
-	c.Object.Call("close")
+func (c *PeerConnection) Close() error {
+	c.closedMtx.Lock()
 
-	return
+	if c.closed {
+		c.closedMtx.Unlock()
+		return nil
+	}
+
+	c.closed = true
+	c.closedMtx.Unlock()
+
+	close(c.closedChan)
+	return nil
 }
 
 ////////////////////////////////////////////////////////////////////////
-//////////////////////////////// RTCConn ///////////////////////////////
+//////////////////////////////// LocalSignaller ////////////////////////
 ////////////////////////////////////////////////////////////////////////
 
-type RTCConn struct {
-	peerConnection *PeerConnection
-	dataChannel    *DataChannel
-
-	readBuffer bytes.Buffer
-	mtx        sync.Mutex
-	cond       *sync.Cond
+type LocalSignaller struct {
+	offerChan        chan interface{}
+	answerChan       chan interface{}
+	iceCandidateChan chan interface{}
 }
 
-func DialRTC(signaller func(*js.Object) error) (*RTCConn, error) {
-	peerConnection, err := NewPeerConnection()
-	if err != nil {
-		return nil, err
+func NewLocalSignaller() *LocalSignaller {
+	return &LocalSignaller{
+		make(chan interface{}),
+		make(chan interface{}),
+		make(chan interface{}),
 	}
-
-	dataChannel, err := peerConnection.CreateDataChannel()
-	if err != nil {
-		return nil, err
-	}
-
-	dataChannel.AddEventListener("open", false, func(evt *js.Object) {
-		log.Print("DataChannel is open")
-	})
-
-	peerConnection.AddEventListener("icecandidate", false, func(evt *js.Object) {
-		iceCandidate := evt.Get("candidate")
-		if iceCandidate == nil {
-			return
-		}
-
-		go func() {
-			if err := signaller(iceCandidate); err != nil {
-				panic(err)
-			}
-		}()
-	})
-
-	c := &RTCConn{
-		peerConnection: peerConnection,
-		dataChannel:    dataChannel,
-	}
-
-	c.cond = sync.NewCond(&c.mtx)
-
-	dataChannel.AddEventListener("message", false, func(evt *js.Object) {
-		data := js.Global.Get("Uint8Array").New(evt.Get("data")).Interface().([]byte)
-		c.mtx.Lock()
-		c.readBuffer.Write(data)
-		c.cond.Broadcast()
-		c.mtx.Unlock()
-	})
-
-	return c, nil
 }
 
-func (c *RTCConn) Write(b []byte) (int, error) {
-	totalSize := len(b)
-	var chunk []byte
-	for rem := totalSize; rem > 0; {
-		size := rem
-		if size > chunkSize {
-			size = chunkSize
-		}
-
-		chunk, b = b[:size], b[size:]
-
-		if err := c.dataChannel.Send(chunk); err != nil {
-			return totalSize - rem, err
-		}
-
-		if c.dataChannel.BufferedAmount > highWaterMark {
-			for c.dataChannel.BufferedAmount > lowWaterMark {
-				time.Sleep(pollTimeout)
-			}
-		}
-
-		rem -= size
+func (s *LocalSignaller) PushOffer(ctx context.Context, offer interface{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.offerChan <- offer:
+		return nil
 	}
-
-	return totalSize, nil
 }
 
-func (c *RTCConn) Read(b []byte) (int, error) {
-	c.mtx.Lock()
-	for c.readBuffer.Len() == 0 {
-		c.cond.Wait()
+func (s *LocalSignaller) PullOffer(ctx context.Context) (interface{}, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case offer := <-s.offerChan:
+		return offer, nil
 	}
-	n, err := c.readBuffer.Read(b)
-	c.mtx.Unlock()
-	return n, err
 }
 
-func (c *RTCConn) Close() error {
-	return errors.New("Not implemented yet")
+func (s *LocalSignaller) PushAnswer(ctx context.Context, answer interface{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.answerChan <- answer:
+		return nil
+	}
+}
+
+func (s *LocalSignaller) PullAnswer(ctx context.Context) (interface{}, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case answer := <-s.answerChan:
+		return answer, nil
+	}
+}
+
+func (s *LocalSignaller) PushICECandidate(ctx context.Context, iceCanidate interface{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.iceCandidateChan <- iceCanidate:
+		return nil
+	}
+}
+
+func (s *LocalSignaller) PullICECandidate(ctx context.Context) (interface{}, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case iceCandidate := <-s.iceCandidateChan:
+		return iceCandidate, nil
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -462,70 +736,43 @@ func (c *RTCConn) Close() error {
 ////////////////////////////////////////////////////////////////////////
 
 func main() {
-	var (
-		c1, c2 *RTCConn
-		err    error
-	)
-
-	c1, err = DialRTC(func(iceCandidate *js.Object) error {
-		return c2.peerConnection.AddICECandidate(iceCandidate)
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	c2, err = DialRTC(func(iceCandidate *js.Object) error {
-		return c2.peerConnection.AddICECandidate(iceCandidate)
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	offer, err := c1.peerConnection.CreateOffer()
-	if err != nil {
-		panic(err)
-	}
-
-	answer, err := c2.peerConnection.AcceptOfferAndCreateAnswer(offer)
-	if err != nil {
-		panic(err)
-	}
-
-	err = c1.peerConnection.AcceptAnswer(answer)
-	if err != nil {
-		panic(err)
-	}
-
-	////////////////////////////////////////////////////////////////////////
-	//////////////////////////////// Connected /////////////////////////////
-	////////////////////////////////////////////////////////////////////////
-
-	transferred := 0
+	ctx := context.Background()
+	signaller := NewLocalSignaller()
 
 	go func() {
+		c2, err := ListenPeerConnection(ctx, signaller)
+		if err != nil {
+			panic(err)
+		}
+
+		transferred := 0
 		buf := make([]byte, 1024*1024)
 		for {
-			n, err := c2.Read(buf)
-			transferred += n
-			log.Print(n, transferred, err)
-		}
-	}()
-
-	c1.dataChannel.AddEventListener("open", false, func(evt *js.Object) {
-
-		go func() {
-			b := make([]byte, chunkSize)
-			_, err := io.ReadFull(rand.Reader, b)
+			n, err := c2.DataChannel.Read(buf)
 			if err != nil {
 				panic(err)
 			}
+			transferred += n
+			log.Printf("Read bytes (%d) and total bytes (%d) with error (%v)", n, transferred, err)
+		}
+	}()
 
-			var dest bytes.Buffer
-			for i := 0; i < 10000; i++ {
-				dest.Write(b)
-			}
+	c1, err := DialPeerConnection(ctx, signaller)
+	if err != nil {
+		panic(err)
+	}
 
-			log.Print(c1.Write(dest.Bytes()))
-		}()
-	})
+	b := make([]byte, chunkSize)
+	_, err = io.ReadFull(rand.Reader, b)
+	if err != nil {
+		panic(err)
+	}
+
+	var dest bytes.Buffer
+	for i := 0; i < 10000; i++ {
+		dest.Write(b)
+	}
+
+	n, err := c1.DataChannel.Write(dest.Bytes())
+	log.Printf("Written bytes (%d) with error (%v)", n, err)
 }
