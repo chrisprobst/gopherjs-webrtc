@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"time"
 
 	"github.com/gopherjs/gopherjs/js"
 )
@@ -109,14 +110,15 @@ type DataChannel struct {
 	*js.Object
 	peerConnection *PeerConnection
 
-	Label          string     `js:"label"`
-	Ordered        bool       `js:"ordered"`
-	Protocol       string     `js:"protocol"`
-	ID             uint16     `js:"id"`
-	ReadyState     ReadyState `js:"readyState"`
-	BufferedAmount uint32     `js:"bufferedAmount"`
-	Negotiated     bool       `js:"negotiated"`
-	BinaryType     string     `js:"binaryType"`
+	Label                      string     `js:"label"`
+	Ordered                    bool       `js:"ordered"`
+	Protocol                   string     `js:"protocol"`
+	ID                         uint16     `js:"id"`
+	ReadyState                 ReadyState `js:"readyState"`
+	BufferedAmount             uint32     `js:"bufferedAmount"`
+	Negotiated                 bool       `js:"negotiated"`
+	BinaryType                 string     `js:"binaryType"`
+	BufferedAmountLowThreshold uint32     `js:bufferedAmountLowThreshold"`
 }
 
 func (c *DataChannel) AddEventListener(typ string, useCapture bool, listener func(*js.Object)) {
@@ -224,6 +226,7 @@ func (c *PeerConnection) CreateDataChannel() (dc *DataChannel, err error) {
 	}
 
 	dc.BinaryType = "arraybuffer"
+	dc.BufferedAmountLowThreshold = 0xFFFF
 
 	return
 }
@@ -438,20 +441,42 @@ func main() {
 		panic(err)
 	}
 
+	counter := 0
+
 	c2.dataChannel.AddEventListener("message", false, func(evt *js.Object) {
-		log.Printf("DataChannel received message: %v", evt.Get("data"))
+		log.Printf("DataChannel received message number %d with content %v", counter, evt.Get("data"))
+		counter++
+	})
+
+	var (
+		readable chan struct{}
+	)
+
+	c1.dataChannel.AddEventListener("bufferedamountlow", false, func(evt *js.Object) {
+		if readable != nil {
+			close(readable)
+			readable = nil
+		}
 	})
 
 	c1.dataChannel.AddEventListener("open", false, func(evt *js.Object) {
+
 		go func() {
-			b := make([]byte, 1024*8)
+			b := make([]byte, 1024*16)
 			_, err := io.ReadFull(rand.Reader, b)
 			if err != nil {
 				panic(err)
 			}
 
 			for i := 0; i < 10000; i++ {
-				log.Print("Start sending...", c1.dataChannel.Send(b), c1.dataChannel.BufferedAmount)
+				err = c1.dataChannel.Send(b)
+				for c1.dataChannel.BufferedAmount > 1024*1024*4 {
+					readable = make(chan struct{}, 1)
+					select {
+					case <-readable:
+					case <-time.After(1000):
+					}
+				}
 			}
 		}()
 	})
