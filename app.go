@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gopherjs/gopherjs/js"
@@ -65,6 +67,13 @@ var (
 	}
 
 	adaptedConstraints map[string]interface{}
+)
+
+const (
+	chunkSize     = 1024 * 16
+	highWaterMark = 4 * 1024 * 1024
+	lowWaterMark  = 128 * 1024
+	pollTimeout   = time.Millisecond * 250
 )
 
 func init() {
@@ -216,17 +225,18 @@ func (c *PeerConnection) CreateDataChannel() (dc *DataChannel, err error) {
 		}
 	}()
 
+	object := c.Object.Call("createDataChannel", "main", map[string]interface{}{
+		"ordered":    true,
+		"negotiated": true,
+		"id":         1,
+	})
+
 	dc = &DataChannel{
-		Object: c.Object.Call("createDataChannel", "main", map[string]interface{}{
-			"ordered":    true,
-			"negotiated": true,
-			"id":         1,
-		}),
+		Object:         object,
 		peerConnection: c,
 	}
 
 	dc.BinaryType = "arraybuffer"
-	dc.BufferedAmountLowThreshold = 0xFFFF
 
 	return
 }
@@ -354,9 +364,13 @@ func (c *PeerConnection) Close() (err error) {
 type RTCConn struct {
 	peerConnection *PeerConnection
 	dataChannel    *DataChannel
+
+	readBuffer bytes.Buffer
+	mtx        sync.Mutex
+	cond       *sync.Cond
 }
 
-func DialRTC(signaller func(*js.Object) error) (c *RTCConn, err error) {
+func DialRTC(signaller func(*js.Object) error) (*RTCConn, error) {
 	peerConnection, err := NewPeerConnection()
 	if err != nil {
 		return nil, err
@@ -384,18 +398,59 @@ func DialRTC(signaller func(*js.Object) error) (c *RTCConn, err error) {
 		}()
 	})
 
-	return &RTCConn{
-		peerConnection,
-		dataChannel,
-	}, nil
+	c := &RTCConn{
+		peerConnection: peerConnection,
+		dataChannel:    dataChannel,
+	}
+
+	c.cond = sync.NewCond(&c.mtx)
+
+	dataChannel.AddEventListener("message", false, func(evt *js.Object) {
+		data := js.Global.Get("Uint8Array").New(evt.Get("data")).Interface().([]byte)
+		c.mtx.Lock()
+		c.readBuffer.Write(data)
+		c.cond.Broadcast()
+		c.mtx.Unlock()
+	})
+
+	return c, nil
 }
 
 func (c *RTCConn) Write(b []byte) (int, error) {
-	return 0, errors.New("Not implemented yet")
+	totalSize := len(b)
+	var chunk []byte
+	for rem := totalSize; rem > 0; {
+		size := rem
+		if size > chunkSize {
+			size = chunkSize
+		}
+
+		chunk, b = b[:size], b[size:]
+
+		if err := c.dataChannel.Send(chunk); err != nil {
+			return totalSize - rem, err
+		}
+
+		if c.dataChannel.BufferedAmount > highWaterMark {
+			for c.dataChannel.BufferedAmount > lowWaterMark {
+				time.Sleep(pollTimeout)
+			}
+		}
+
+		rem -= size
+	}
+
+	return totalSize, nil
 }
 
 func (c *RTCConn) Read(b []byte) (int, error) {
-	return 0, errors.New("Not implemented yet")
+	c.mtx.Lock()
+	for c.readBuffer.Len() == 0 {
+		c.cond.Wait()
+	}
+	n, err := c.readBuffer.Read(b)
+	c.mtx.Unlock()
+	return n, err
 }
 
 func (c *RTCConn) Close() error {
@@ -441,43 +496,36 @@ func main() {
 		panic(err)
 	}
 
-	counter := 0
+	////////////////////////////////////////////////////////////////////////
+	//////////////////////////////// Connected /////////////////////////////
+	////////////////////////////////////////////////////////////////////////
 
-	c2.dataChannel.AddEventListener("message", false, func(evt *js.Object) {
-		log.Printf("DataChannel received message number %d with content %v", counter, evt.Get("data"))
-		counter++
-	})
+	transferred := 0
 
-	var (
-		readable chan struct{}
-	)
-
-	c1.dataChannel.AddEventListener("bufferedamountlow", false, func(evt *js.Object) {
-		if readable != nil {
-			close(readable)
-			readable = nil
+	go func() {
+		buf := make([]byte, 1024*1024)
+		for {
+			n, err := c2.Read(buf)
+			transferred += n
+			log.Print(n, transferred, err)
 		}
-	})
+	}()
 
 	c1.dataChannel.AddEventListener("open", false, func(evt *js.Object) {
 
 		go func() {
-			b := make([]byte, 1024*16)
+			b := make([]byte, chunkSize)
 			_, err := io.ReadFull(rand.Reader, b)
 			if err != nil {
 				panic(err)
 			}
 
+			var dest bytes.Buffer
 			for i := 0; i < 10000; i++ {
-				err = c1.dataChannel.Send(b)
-				for c1.dataChannel.BufferedAmount > 1024*1024*4 {
-					readable = make(chan struct{}, 1)
-					select {
-					case <-readable:
-					case <-time.After(1000):
-					}
-				}
+				dest.Write(b)
 			}
+
+			log.Print(c1.Write(dest.Bytes()))
 		}()
 	})
 }
