@@ -177,17 +177,6 @@ func newDataChannel(dataChannelObject *js.Object) *DataChannel {
 		// Wait for data channel to close
 		<-dataChannel.Closed()
 
-		// Make sure to wake up waiting readers
-		dataChannel.readMtx.Lock()
-		dataChannel.readCond.Broadcast()
-		dataChannel.readCond = nil
-		dataChannel.readMtx.Unlock()
-	}()
-
-	go func() {
-		// Wait for data channel to close
-		<-dataChannel.Closed()
-
 		// Panic on javascript errors
 		defer func() {
 			e := recover()
@@ -218,6 +207,13 @@ func newDataChannel(dataChannelObject *js.Object) *DataChannel {
 
 	dataChannel.AddEventListener("close", false, func(evt *js.Object) {
 		dataChannel.Close()
+
+		// Make sure to wake up waiting readers
+		dataChannel.readMtx.Lock()
+		readCond := dataChannel.readCond
+		dataChannel.readCond = nil
+		readCond.Broadcast()
+		dataChannel.readMtx.Unlock()
 	})
 
 	dataChannel.AddEventListener("message", false, func(evt *js.Object) {
@@ -342,7 +338,7 @@ type PeerConnection struct {
 	closed    bool
 }
 
-func newPeerConnection(ctx context.Context, dial bool, signaller Signaller) (peerConnection *PeerConnection, err error) {
+func newPeerConnection(ctx context.Context) (peerConnection *PeerConnection, err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -431,13 +427,18 @@ func newPeerConnection(ctx context.Context, dial bool, signaller Signaller) (pee
 		<-peerConnection.Closed()
 	}()
 
-	////////////////////////////////////////////////////////////////////////
-	//////////////////////////////// Dialing ///////////////////////////////
-	////////////////////////////////////////////////////////////////////////
+	return
+}
+
+func DialPeerConnection(ctx context.Context, signaller Signaller) (peerConnection *PeerConnection, err error) {
+	peerConnection, err = newPeerConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	// Close if data channel is open
 	openChan := make(chan struct{})
-	dataChannel.AddEventListener("open", false, func(evt *js.Object) {
+	peerConnection.DataChannel.AddEventListener("open", false, func(evt *js.Object) {
 		close(openChan)
 	})
 
@@ -456,39 +457,22 @@ func newPeerConnection(ctx context.Context, dial bool, signaller Signaller) (pee
 		}()
 	})
 
-	// Dial or listen
-	if dial {
-		offer, err := peerConnection.CreateOffer(ctx)
-		if err != nil {
-			return nil, err
-		}
+	offer, err := peerConnection.CreateOffer(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-		if err := signaller.PushOffer(ctx, offer); err != nil {
-			return nil, err
-		}
+	if err := signaller.PushOffer(ctx, offer); err != nil {
+		return nil, err
+	}
 
-		answer, err := signaller.PullAnswer(ctx)
-		if err != nil {
-			return nil, err
-		}
+	answer, err := signaller.PullAnswer(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-		if err := peerConnection.AcceptAnswer(ctx, answer); err != nil {
-			return nil, err
-		}
-	} else {
-		offer, err := signaller.PullOffer(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		answer, err := peerConnection.AcceptOfferAndCreateAnswer(ctx, offer)
-		if err != nil {
-			return nil, err
-		}
-
-		if err := signaller.PushAnswer(ctx, answer); err != nil {
-			return nil, err
-		}
+	if err := peerConnection.AcceptAnswer(ctx, answer); err != nil {
+		return nil, err
 	}
 
 	ctxICE, cancelICE := context.WithCancel(ctx)
@@ -501,7 +485,6 @@ func newPeerConnection(ctx context.Context, dial bool, signaller Signaller) (pee
 	}()
 
 	go func() {
-
 		for {
 			iceCandidate, err := signaller.PullICECandidate(ctxICE)
 			if err != nil {
@@ -526,12 +509,79 @@ func newPeerConnection(ctx context.Context, dial bool, signaller Signaller) (pee
 	}
 }
 
-func DialPeerConnection(ctx context.Context, signaller Signaller) (peerConnection *PeerConnection, err error) {
-	return newPeerConnection(ctx, true, signaller)
-}
-
 func ListenPeerConnection(ctx context.Context, signaller Signaller) (peerConnection *PeerConnection, err error) {
-	return newPeerConnection(ctx, false, signaller)
+	peerConnection, err = newPeerConnection(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Close if data channel is open
+	openChan := make(chan struct{})
+	peerConnection.DataChannel.AddEventListener("open", false, func(evt *js.Object) {
+		close(openChan)
+	})
+
+	// Listen for ice candidate and push to remote
+	peerConnection.AddEventListener("icecandidate", false, func(evt *js.Object) {
+		iceCandidate := evt.Get("candidate")
+		if iceCandidate == nil {
+			return
+		}
+
+		go func() {
+			if err := signaller.PushICECandidate(ctx, iceCandidate); err != nil {
+				log.Printf("PeerConnection failed to push ice candidate due to error (%v)", err)
+				peerConnection.Close()
+			}
+		}()
+	})
+
+	offer, err := signaller.PullOffer(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	answer, err := peerConnection.AcceptOfferAndCreateAnswer(ctx, offer)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := signaller.PushAnswer(ctx, answer); err != nil {
+		return nil, err
+	}
+
+	ctxICE, cancelICE := context.WithCancel(ctx)
+	go func() {
+		defer cancelICE()
+		select {
+		case <-openChan:
+		case <-peerConnection.Closed():
+		}
+	}()
+
+	go func() {
+		for {
+			iceCandidate, err := signaller.PullICECandidate(ctxICE)
+			if err != nil {
+				log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
+				return
+			}
+
+			if err := peerConnection.AddICECandidate(ctx, iceCandidate); err != nil {
+				log.Printf("PeerConnection failed to add ice candidate due to error (%v)", err)
+				peerConnection.Close()
+				return
+			}
+		}
+	}()
+
+	// Make sure to wait for open / close
+	select {
+	case <-peerConnection.Closed():
+		return nil, ErrPeerConnectionClosed
+	case <-openChan:
+		return
+	}
 }
 
 func (c *PeerConnection) AddEventListener(typ string, useCapture bool, listener func(*js.Object)) {
