@@ -16,7 +16,7 @@ import (
 ////////////////////////////////////////////////////////////////////////
 
 var (
-	ErrWebConnClosed = errors.New("WebConn is closed")
+	ErrWebConnClosed = errors.New("WebConn closed")
 )
 
 ////////////////////////////////////////////////////////////////////////
@@ -124,6 +124,8 @@ func NewWebConn(ctx context.Context, object *js.Object) *WebConn {
 
 		// Finally close the underlying object
 		webConn.Object.Call("close")
+
+		log.Printf("WebConn closed")
 
 		return
 	}()

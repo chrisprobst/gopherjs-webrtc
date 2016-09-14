@@ -107,6 +107,9 @@ func main() {
 		for {
 			n, err := c2.DataChannel.Read(buf)
 			if err != nil {
+				if err == ErrWebConnClosed {
+					return
+				}
 				panic(err)
 			}
 			transferred += n
@@ -131,4 +134,5 @@ func main() {
 
 	n, err := c1.DataChannel.Write(dest.Bytes())
 	log.Printf("Written bytes (%d) with error (%v)", n, err)
+	c1.Close()
 }
