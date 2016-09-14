@@ -75,7 +75,7 @@ type PeerConnection struct {
 
 	// Channels
 	iceCandidateChan chan interface{}
-	closedChan       chan struct{}
+	closedChan       SignalChan
 
 	// Live cycle
 	closedMtx sync.Mutex
@@ -110,7 +110,7 @@ func NewPeerConnection(ctx context.Context) (peerConnection *PeerConnection, err
 		Object:           peerConnectionObject,
 		DataChannel:      dataChannel,
 		iceCandidateChan: make(chan interface{}, defautMaxICECandidates),
-		closedChan:       make(chan struct{}),
+		closedChan:       make(SignalChan),
 	}
 
 	////////////////////////////////////////////////////////////////////////
@@ -289,15 +289,105 @@ func (c *PeerConnection) AddICECandidate(ctx context.Context, iceCandidate inter
 	return
 }
 
-func (c *PeerConnection) ICECandidates() <-chan interface{} {
-	return c.iceCandidateChan
+func (c *PeerConnection) WaitForICECandidate(ctx context.Context) (interface{}, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case iceCandidateChan := <-c.iceCandidateChan:
+		return iceCandidateChan, nil
+	case <-c.Closed():
+		return nil, ErrPeerConnectionClosed
+	}
 }
 
-func (c *PeerConnection) Open() <-chan struct{} {
+func (c *PeerConnection) PullAndAddICECandidates(ctx context.Context, pullFunc func(context.Context) (interface{}, error)) error {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer cancel()
+		<-c.Closed()
+	}()
+
+	for {
+		iceCandidate, err := pullFunc(ctx)
+		if err != nil {
+			log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
+			return err
+		}
+
+		if err := c.AddICECandidate(ctx, iceCandidate); err != nil {
+			log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
+			return err
+		}
+	}
+}
+
+func (c *PeerConnection) Dial(ctx context.Context, signaller DialSignaller) error {
+	offer, err := c.CreateOffer(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := signaller.PushOffer(ctx, offer); err != nil {
+		return err
+	}
+
+	answer, err := signaller.PullAnswer(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := c.AcceptAnswer(ctx, answer); err != nil {
+		return err
+	}
+
+	go func() {
+		if err := c.PullAndAddICECandidates(ctx, signaller.RequestICECandidate); err != nil {
+			c.Close()
+		}
+	}()
+
+	select {
+	case <-c.Closed():
+		return ErrPeerConnectionClosed
+	case <-c.Open():
+		return nil
+	}
+}
+
+func (c *PeerConnection) Listen(ctx context.Context, signaller ListenSignaller) error {
+	offer, err := signaller.PullOffer(ctx)
+	if err != nil {
+		return err
+	}
+
+	answer, err := c.AcceptOfferAndCreateAnswer(ctx, offer)
+	if err != nil {
+		return err
+	}
+
+	if err := signaller.PushAnswer(ctx, answer); err != nil {
+		return err
+	}
+
+	go func() {
+		if err := c.PullAndAddICECandidates(ctx, signaller.RequestICECandidate); err != nil {
+			c.Close()
+		}
+	}()
+
+	select {
+	case <-c.Closed():
+		return ErrPeerConnectionClosed
+	case <-c.Open():
+		return nil
+	}
+}
+
+func (c *PeerConnection) Open() SignalChan {
 	return c.DataChannel.Open()
 }
 
-func (c *PeerConnection) Closed() <-chan struct{} {
+func (c *PeerConnection) Closed() SignalChan {
 	return c.closedChan
 }
 

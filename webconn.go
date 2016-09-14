@@ -72,8 +72,8 @@ type WebConn struct {
 	BinaryType     string `js:"binaryType"`
 
 	// Channels
-	openChan   chan struct{}
-	closedChan chan struct{}
+	openChan   SignalChan
+	closedChan SignalChan
 
 	// Live cycle
 	closedMtx sync.Mutex
@@ -91,8 +91,8 @@ func NewWebConn(ctx context.Context, object *js.Object) *WebConn {
 
 	webConn := &WebConn{
 		Object:     object,
-		openChan:   make(chan struct{}),
-		closedChan: make(chan struct{}),
+		openChan:   make(SignalChan),
+		closedChan: make(SignalChan),
 	}
 	webConn.readCond = sync.NewCond(&webConn.readMtx)
 	webConn.BinaryType = "arraybuffer"
@@ -255,11 +255,11 @@ func (c *WebConn) ReadyState() ReadyState {
 	}
 }
 
-func (c *WebConn) Open() <-chan struct{} {
+func (c *WebConn) Open() SignalChan {
 	return c.openChan
 }
 
-func (c *WebConn) Closed() <-chan struct{} {
+func (c *WebConn) Closed() SignalChan {
 	return c.closedChan
 }
 

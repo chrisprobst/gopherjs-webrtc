@@ -9,175 +9,32 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////
-//////////////////////////////// Signaller /////////////////////////////
-////////////////////////////////////////////////////////////////////////
-
-type Signaller interface {
-	PushOffer(context.Context, interface{}) error
-	PullOffer(context.Context) (interface{}, error)
-	PushAnswer(context.Context, interface{}) error
-	PullAnswer(context.Context) (interface{}, error)
-	PushICECandidate(context.Context, interface{}) error
-	PullICECandidate(context.Context) (interface{}, error)
-}
-
-func DialPeerConnection(ctx context.Context, signaller Signaller) (peerConnection *PeerConnection, err error) {
-	peerConnection, err = NewPeerConnection(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	offer, err := peerConnection.CreateOffer(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := signaller.PushOffer(ctx, offer); err != nil {
-		return nil, err
-	}
-
-	answer, err := signaller.PullAnswer(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := peerConnection.AcceptAnswer(ctx, answer); err != nil {
-		return nil, err
-	}
-
-	ctxICE, cancelICE := context.WithCancel(ctx)
-	go func() {
-		defer cancelICE()
-		<-peerConnection.Closed()
-	}()
-
-	// Pull remote ice candidates and add them locally
-	go func() {
-		for {
-			iceCandidate, err := signaller.PullICECandidate(ctxICE)
-			if err != nil {
-				log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
-				return
-			}
-
-			if err := peerConnection.AddICECandidate(ctx, iceCandidate); err != nil {
-				log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
-				peerConnection.Close()
-				return
-			}
-		}
-	}()
-
-	// Push our ice candidates to the remote
-	go func() {
-		for {
-			select {
-			case iceCandidate := <-peerConnection.ICECandidates():
-				if err := signaller.PushICECandidate(ctx, iceCandidate); err != nil {
-					log.Printf("PeerConnection failed to push ice candidate due to error (%v)", err)
-					peerConnection.Close()
-					return
-				}
-			case <-ctxICE.Done():
-				return
-			}
-		}
-	}()
-
-	select {
-	case <-peerConnection.Closed():
-		return nil, ErrPeerConnectionClosed
-	case <-peerConnection.Open():
-		return
-	}
-}
-
-func ListenPeerConnection(ctx context.Context, signaller Signaller) (peerConnection *PeerConnection, err error) {
-	peerConnection, err = NewPeerConnection(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	offer, err := signaller.PullOffer(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	answer, err := peerConnection.AcceptOfferAndCreateAnswer(ctx, offer)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := signaller.PushAnswer(ctx, answer); err != nil {
-		return nil, err
-	}
-
-	ctxICE, cancelICE := context.WithCancel(ctx)
-	go func() {
-		defer cancelICE()
-		<-peerConnection.Closed()
-	}()
-
-	// Pull remote ice candidates and add them locally
-	go func() {
-		for {
-			iceCandidate, err := signaller.PullICECandidate(ctxICE)
-			if err != nil {
-				log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
-				return
-			}
-
-			if err := peerConnection.AddICECandidate(ctx, iceCandidate); err != nil {
-				log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
-				peerConnection.Close()
-				return
-			}
-		}
-	}()
-
-	// Push our ice candidates to the remote
-	go func() {
-		for {
-			select {
-			case iceCandidate := <-peerConnection.ICECandidates():
-				if err := signaller.PushICECandidate(ctx, iceCandidate); err != nil {
-					log.Printf("PeerConnection failed to push ice candidate due to error (%v)", err)
-					peerConnection.Close()
-					return
-				}
-			case <-ctxICE.Done():
-				return
-			}
-		}
-	}()
-
-	select {
-	case <-peerConnection.Closed():
-		return nil, ErrPeerConnectionClosed
-	case <-peerConnection.Open():
-		return
-	}
-}
-
-////////////////////////////////////////////////////////////////////////
 //////////////////////////////// LocalSignaller ////////////////////////
 ////////////////////////////////////////////////////////////////////////
 
-type LocalSignaller struct {
-	offerChan        chan interface{}
-	answerChan       chan interface{}
-	iceCandidateChan chan interface{}
+type LocalDialSignaller struct {
+	localPeerConnection  *PeerConnection
+	remotePeerConnection *PeerConnection
+	offerChan            chan interface{}
+	answerChan           chan interface{}
 }
 
-func NewLocalSignaller() *LocalSignaller {
-	return &LocalSignaller{
-		make(chan interface{}),
-		make(chan interface{}),
-		make(chan interface{}),
-	}
+type LocalListenSignaller struct {
+	localPeerConnection  *PeerConnection
+	remotePeerConnection *PeerConnection
+	offerChan            chan interface{}
+	answerChan           chan interface{}
 }
 
-func (s *LocalSignaller) PushOffer(ctx context.Context, offer interface{}) error {
+func NewLocalSignallers(a, b *PeerConnection) (*LocalDialSignaller, *LocalListenSignaller) {
+	offerChan := make(chan interface{})
+	answerChan := make(chan interface{})
+	dialSignaller := &LocalDialSignaller{a, b, offerChan, answerChan}
+	listenSignaller := &LocalListenSignaller{b, a, offerChan, answerChan}
+	return dialSignaller, listenSignaller
+}
+
+func (s *LocalDialSignaller) PushOffer(ctx context.Context, offer interface{}) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -186,7 +43,7 @@ func (s *LocalSignaller) PushOffer(ctx context.Context, offer interface{}) error
 	}
 }
 
-func (s *LocalSignaller) PullOffer(ctx context.Context) (interface{}, error) {
+func (s *LocalListenSignaller) PullOffer(ctx context.Context) (interface{}, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -195,7 +52,7 @@ func (s *LocalSignaller) PullOffer(ctx context.Context) (interface{}, error) {
 	}
 }
 
-func (s *LocalSignaller) PushAnswer(ctx context.Context, answer interface{}) error {
+func (s *LocalListenSignaller) PushAnswer(ctx context.Context, answer interface{}) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -204,7 +61,7 @@ func (s *LocalSignaller) PushAnswer(ctx context.Context, answer interface{}) err
 	}
 }
 
-func (s *LocalSignaller) PullAnswer(ctx context.Context) (interface{}, error) {
+func (s *LocalDialSignaller) PullAnswer(ctx context.Context) (interface{}, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -213,22 +70,12 @@ func (s *LocalSignaller) PullAnswer(ctx context.Context) (interface{}, error) {
 	}
 }
 
-func (s *LocalSignaller) PushICECandidate(ctx context.Context, iceCanidate interface{}) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case s.iceCandidateChan <- iceCanidate:
-		return nil
-	}
+func (s *LocalDialSignaller) RequestICECandidate(ctx context.Context) (interface{}, error) {
+	return s.remotePeerConnection.WaitForICECandidate(ctx)
 }
 
-func (s *LocalSignaller) PullICECandidate(ctx context.Context) (interface{}, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case iceCandidate := <-s.iceCandidateChan:
-		return iceCandidate, nil
-	}
+func (s *LocalListenSignaller) RequestICECandidate(ctx context.Context) (interface{}, error) {
+	return s.remotePeerConnection.WaitForICECandidate(ctx)
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -237,11 +84,21 @@ func (s *LocalSignaller) PullICECandidate(ctx context.Context) (interface{}, err
 
 func main() {
 	ctx := context.Background()
-	signaller := NewLocalSignaller()
+
+	c1, err := NewPeerConnection(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	c2, err := NewPeerConnection(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	dialSignaller, listenSignaller := NewLocalSignallers(c1, c2)
 
 	go func() {
-		c2, err := ListenPeerConnection(ctx, signaller)
-		if err != nil {
+		if err := c2.Listen(ctx, listenSignaller); err != nil {
 			panic(err)
 		}
 
@@ -257,8 +114,7 @@ func main() {
 		}
 	}()
 
-	c1, err := DialPeerConnection(ctx, signaller)
-	if err != nil {
+	if err := c1.Dial(ctx, dialSignaller); err != nil {
 		panic(err)
 	}
 
