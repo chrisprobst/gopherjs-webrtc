@@ -6,18 +6,16 @@ import "context"
 //////////////////////////////// Signaller /////////////////////////////
 ////////////////////////////////////////////////////////////////////////
 
-type ICESignaller interface {
-	RequestICECandidate(context.Context) (interface{}, error)
-}
+type Command string
 
-type DialSignaller interface {
-	ICESignaller
-	PushOffer(context.Context, interface{}) error
-	PullAnswer(context.Context) (interface{}, error)
-}
+const (
+	CmdOffer Command = "offer"
+	CmdICE   Command = "ice"
+)
 
-type ListenSignaller interface {
-	ICESignaller
-	PullOffer(context.Context) (interface{}, error)
-	PushAnswer(context.Context, interface{}) error
+type SignalHandler func(ctx context.Context, remoteID string, command Command, req interface{}) (res interface{}, err error)
+
+type Signaller interface {
+	Signal(ctx context.Context, remoteID string, command Command, req interface{}) (res interface{}, err error)
+	OnSignal(signalHandler SignalHandler)
 }

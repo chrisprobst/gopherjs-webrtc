@@ -32,29 +32,29 @@ const (
 ////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////
 
-type ReadyState struct {
+type WrappedReadyState struct {
 	Index int
 	Name  string
 }
 
-func (s *ReadyState) String() string {
+func (s *WrappedReadyState) String() string {
 	return s.Name
 }
 
 var (
-	Connecting = ReadyState{0, "connecting"}
-	Open       = ReadyState{1, "open"}
-	Closing    = ReadyState{2, "closing"}
-	Closed     = ReadyState{3, "closed"}
+	Connecting = WrappedReadyState{0, "connecting"}
+	Open       = WrappedReadyState{1, "open"}
+	Closing    = WrappedReadyState{2, "closing"}
+	Closed     = WrappedReadyState{3, "closed"}
 
-	ReadyStatesByIndex = map[int]ReadyState{
+	WrappedReadyStatesByIndex = map[int]WrappedReadyState{
 		Connecting.Index: Connecting,
 		Open.Index:       Open,
 		Closing.Index:    Closing,
 		Closed.Index:     Closed,
 	}
 
-	ReadyStatesByName = map[string]ReadyState{
+	WrappedReadyStatesByName = map[string]WrappedReadyState{
 		Connecting.Name: Connecting,
 		Open.Name:       Open,
 		Closing.Name:    Closing,
@@ -68,8 +68,9 @@ var (
 type WebConn struct {
 	*js.Object
 
-	BufferedAmount uint32 `js:"bufferedAmount"`
-	BinaryType     string `js:"binaryType"`
+	BufferedAmount uint32      `js:"bufferedAmount"`
+	BinaryType     string      `js:"binaryType"`
+	ReadyState     interface{} `js:"readyState"`
 
 	// Channels
 	openChan   SignalChan
@@ -97,7 +98,7 @@ func NewWebConn(ctx context.Context, object *js.Object) *WebConn {
 	webConn.readCond = sync.NewCond(&webConn.readMtx)
 	webConn.BinaryType = "arraybuffer"
 
-	if webConn.ReadyState() != Connecting {
+	if webConn.WrapReadyState() != Connecting {
 		panic("WebConn object must be in connecting mode")
 	}
 
@@ -153,12 +154,12 @@ func NewWebConn(ctx context.Context, object *js.Object) *WebConn {
 	webConn.AddEventListener("close", false, func(evt *js.Object) {
 		webConn.Close()
 
-		// Make sure to wake up waiting readers
 		webConn.readMtx.Lock()
+		defer webConn.readMtx.Unlock()
+
 		readCond := webConn.readCond
 		webConn.readCond = nil
 		readCond.Broadcast()
-		webConn.readMtx.Unlock()
 	})
 
 	webConn.AddEventListener("message", false, func(evt *js.Object) {
@@ -166,6 +167,7 @@ func NewWebConn(ctx context.Context, object *js.Object) *WebConn {
 
 		webConn.readMtx.Lock()
 		defer webConn.readMtx.Unlock()
+
 		webConn.readBuffer.Write(data)
 		webConn.readCond.Broadcast()
 	})
@@ -246,12 +248,12 @@ func (c *WebConn) Read(b []byte) (int, error) {
 	return c.readBuffer.Read(b)
 }
 
-func (c *WebConn) ReadyState() ReadyState {
-	readyState := c.Object.Get("readyState").Interface()
+func (c *WebConn) WrapReadyState() WrappedReadyState {
+	readyState := c.ReadyState
 	if readyStateIndex, ok := readyState.(int); ok {
-		return ReadyStatesByIndex[readyStateIndex]
+		return WrappedReadyStatesByIndex[readyStateIndex]
 	} else if readyStateName, ok := readyState.(string); ok {
-		return ReadyStatesByName[readyStateName]
+		return WrappedReadyStatesByName[readyStateName]
 	} else {
 		panic("Unknown ready state")
 	}

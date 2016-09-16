@@ -10,11 +10,11 @@ import (
 )
 
 ////////////////////////////////////////////////////////////////////////
-//////////////////////////////// PeerConnection ////////////////////////
+//////////////////////////////// Peer //////////////////////////////////
 ////////////////////////////////////////////////////////////////////////
 
 var (
-	ErrPeerConnectionClosed = errors.New("PeerConnection is closed")
+	ErrPeerClosed           = errors.New("Peer closed")
 	ErrDataChannelTriggered = errors.New("DataChannel event triggered")
 
 	peerConnectionConfig = map[string]interface{}{
@@ -67,7 +67,7 @@ func init() {
 ////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////
 
-type PeerConnection struct {
+type Peer struct {
 	*js.Object
 	DataChannel *WebConn
 
@@ -82,14 +82,14 @@ type PeerConnection struct {
 	closed    bool
 }
 
-func NewPeerConnection(ctx context.Context) (peerConnection *PeerConnection, err error) {
+func NewPeer(ctx context.Context) (peer *Peer, err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
 			return
 		}
 		if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
-			peerConnection = nil
+			peer = nil
 			err = jsErr
 		} else {
 			panic(e)
@@ -105,8 +105,8 @@ func NewPeerConnection(ctx context.Context) (peerConnection *PeerConnection, err
 	// Create data channel
 	dataChannel := NewWebConn(ctx, peerConnectionObject.Call("createDataChannel", "main", dataChannelConfig))
 
-	// Create peer connection
-	peerConnection = &PeerConnection{
+	// Create peer
+	peer = &Peer{
 		Object:           peerConnectionObject,
 		DataChannel:      dataChannel,
 		iceCandidateChan: make(chan interface{}, defautMaxICECandidates),
@@ -119,7 +119,7 @@ func NewPeerConnection(ctx context.Context) (peerConnection *PeerConnection, err
 
 	go func() {
 		// Wait for peer connection to close
-		<-peerConnection.Closed()
+		<-peer.Closed()
 
 		// Panic on javascript errors
 		defer func() {
@@ -128,70 +128,70 @@ func NewPeerConnection(ctx context.Context) (peerConnection *PeerConnection, err
 				return
 			}
 			if jsErr, ok := e.(*js.Error); ok && jsErr != nil {
-				log.Printf("PeerConnection failed during closing due to error (%v)", jsErr)
+				log.Printf("Peer failed during closing due to error (%v)", jsErr)
 			} else {
 				panic(e)
 			}
 		}()
 
 		// Finally close the underlying peer connection object
-		if peerConnection.SignalingState != "closed" {
-			peerConnection.Object.Call("close")
+		if peer.SignalingState != "closed" {
+			peer.Object.Call("close")
 		}
 
 		// Also close the data channel
-		peerConnection.DataChannel.Close()
+		peer.DataChannel.Close()
 	}()
 
 	go func() {
 		// Wait for data channel to close
-		<-peerConnection.DataChannel.Closed()
+		<-peer.DataChannel.Closed()
 
 		// Also close the peer connection
-		peerConnection.Close()
+		peer.Close()
 
 		return
 	}()
 
-	peerConnection.AddEventListener("datachannel", false, func(evt *js.Object) {
-		log.Printf("PeerConnection failed due to error (%v)", ErrDataChannelTriggered)
-		peerConnection.Close()
+	go func() {
+		defer peer.Close()
+		<-ctx.Done()
+	}()
+
+	go func() {
+		defer cancel()
+		<-peer.Closed()
+	}()
+
+	peer.AddEventListener("datachannel", false, func(evt *js.Object) {
+		log.Printf("Peer failed due to error (%v)", ErrDataChannelTriggered)
+		peer.Close()
 	})
 
-	peerConnection.AddEventListener("icecandidate", false, func(evt *js.Object) {
+	peer.AddEventListener("icecandidate", false, func(evt *js.Object) {
 		iceCandidate := evt.Get("candidate")
 		if iceCandidate == nil {
 			return
 		}
 
 		select {
-		case peerConnection.iceCandidateChan <- iceCandidate:
+		case peer.iceCandidateChan <- iceCandidate:
 		default:
 		}
 	})
 
-	go func() {
-		defer peerConnection.Close()
-		<-ctx.Done()
-	}()
-
-	go func() {
-		defer cancel()
-		<-peerConnection.Closed()
-	}()
-
 	return
 }
 
-func (c *PeerConnection) AddEventListener(typ string, useCapture bool, listener func(*js.Object)) {
-	c.Object.Call("addEventListener", typ, listener, useCapture)
+func (p *Peer) AddEventListener(typ string, useCapture bool, listener func(*js.Object)) {
+	p.Object.Call("addEventListener", typ, listener, useCapture)
 }
 
-func (c *PeerConnection) RemoveEventListener(typ string, useCapture bool, listener func(*js.Object)) {
-	c.Object.Call("removeEventListener", typ, listener, useCapture)
+func (p *Peer) RemoveEventListener(typ string, useCapture bool, listener func(*js.Object)) {
+	p.Object.Call("removeEventListener", typ, listener, useCapture)
 }
 
-func (c *PeerConnection) CreateOffer(ctx context.Context) (object interface{}, err error) {
+func (p *Peer) CreateOffer(ctx context.Context) (object interface{}, err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -205,12 +205,12 @@ func (c *PeerConnection) CreateOffer(ctx context.Context) (object interface{}, e
 		}
 	}()
 
-	object, err = WaitForPromise(ctx, c.Object.Call("createOffer", adaptedConstraints))
+	object, err = WaitForPromise(ctx, p.Object.Call("createOffer", adaptedConstraints))
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = WaitForPromise(ctx, c.Object.Call("setLocalDescription", object))
+	_, err = WaitForPromise(ctx, p.Object.Call("setLocalDescription", object))
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +218,7 @@ func (c *PeerConnection) CreateOffer(ctx context.Context) (object interface{}, e
 	return
 }
 
-func (c *PeerConnection) AcceptOfferAndCreateAnswer(ctx context.Context, offer interface{}) (object interface{}, err error) {
+func (p *Peer) AcceptOfferAndCreateAnswer(ctx context.Context, offer interface{}) (object interface{}, err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -233,17 +233,17 @@ func (c *PeerConnection) AcceptOfferAndCreateAnswer(ctx context.Context, offer i
 	}()
 
 	rtcSessionDescription := js.Global.Get("window").Get("RTCSessionDescription").New(offer)
-	_, err = WaitForPromise(ctx, c.Object.Call("setRemoteDescription", rtcSessionDescription))
+	_, err = WaitForPromise(ctx, p.Object.Call("setRemoteDescription", rtcSessionDescription))
 	if err != nil {
 		return nil, err
 	}
 
-	object, err = WaitForPromise(ctx, c.Object.Call("createAnswer", adaptedConstraints))
+	object, err = WaitForPromise(ctx, p.Object.Call("createAnswer", adaptedConstraints))
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = WaitForPromise(ctx, c.Object.Call("setLocalDescription", object))
+	_, err = WaitForPromise(ctx, p.Object.Call("setLocalDescription", object))
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +251,7 @@ func (c *PeerConnection) AcceptOfferAndCreateAnswer(ctx context.Context, offer i
 	return
 }
 
-func (c *PeerConnection) AcceptAnswer(ctx context.Context, answer interface{}) (err error) {
+func (p *Peer) AcceptAnswer(ctx context.Context, answer interface{}) (err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -265,12 +265,12 @@ func (c *PeerConnection) AcceptAnswer(ctx context.Context, answer interface{}) (
 	}()
 
 	rtcSessionDescription := js.Global.Get("window").Get("RTCSessionDescription").New(answer)
-	_, err = WaitForPromise(ctx, c.Object.Call("setRemoteDescription", rtcSessionDescription))
+	_, err = WaitForPromise(ctx, p.Object.Call("setRemoteDescription", rtcSessionDescription))
 
 	return
 }
 
-func (c *PeerConnection) AddICECandidate(ctx context.Context, iceCandidate interface{}) (err error) {
+func (p *Peer) AddICECandidate(ctx context.Context, iceCandidate interface{}) (err error) {
 	defer func() {
 		e := recover()
 		if e == nil {
@@ -284,45 +284,45 @@ func (c *PeerConnection) AddICECandidate(ctx context.Context, iceCandidate inter
 	}()
 
 	rtcICECandidate := js.Global.Get("window").Get("RTCIceCandidate").New(iceCandidate)
-	_, err = WaitForPromise(ctx, c.Object.Call("addIceCandidate", rtcICECandidate))
+	_, err = WaitForPromise(ctx, p.Object.Call("addIceCandidate", rtcICECandidate))
 
 	return
 }
 
-func (c *PeerConnection) WaitForICECandidate(ctx context.Context) (interface{}, error) {
+func (p *Peer) WaitForICECandidate(ctx context.Context) (interface{}, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case iceCandidateChan := <-c.iceCandidateChan:
+	case iceCandidateChan := <-p.iceCandidateChan:
 		return iceCandidateChan, nil
-	case <-c.Closed():
-		return nil, ErrPeerConnectionClosed
+	case <-p.Closed():
+		return nil, ErrPeerClosed
 	}
 }
 
-func (c *PeerConnection) PullAndAddICECandidates(ctx context.Context, pullFunc func(context.Context) (interface{}, error)) error {
+func (p *Peer) PullAndAddICECandidates(ctx context.Context, pullFunc func(context.Context) (interface{}, error)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		defer cancel()
-		<-c.Closed()
+		<-p.Closed()
 	}()
 
 	for {
 		iceCandidate, err := pullFunc(ctx)
 		if err != nil {
-			log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
+			log.Printf("Peer failed to pull ice candidate due to error (%v)", err)
 			return err
 		}
 
-		if err := c.AddICECandidate(ctx, iceCandidate); err != nil {
-			log.Printf("PeerConnection failed to pull ice candidate due to error (%v)", err)
+		if err := p.AddICECandidate(ctx, iceCandidate); err != nil {
+			log.Printf("Peer failed to pull ice candidate due to error (%v)", err)
 			return err
 		}
 	}
 }
 
-func (c *PeerConnection) Dial(ctx context.Context, signaller DialSignaller) error {
-	offer, err := c.CreateOffer(ctx)
+func (p *Peer) Dial(ctx context.Context, signaller DialSignaller) error {
+	offer, err := p.CreateOffer(ctx)
 	if err != nil {
 		return err
 	}
@@ -336,31 +336,31 @@ func (c *PeerConnection) Dial(ctx context.Context, signaller DialSignaller) erro
 		return err
 	}
 
-	if err := c.AcceptAnswer(ctx, answer); err != nil {
+	if err := p.AcceptAnswer(ctx, answer); err != nil {
 		return err
 	}
 
 	go func() {
-		if err := c.PullAndAddICECandidates(ctx, signaller.RequestICECandidate); err != nil {
-			c.Close()
+		if err := p.PullAndAddICECandidates(ctx, signaller.RequestICECandidate); err != nil {
+			p.Close()
 		}
 	}()
 
 	select {
-	case <-c.Closed():
-		return ErrPeerConnectionClosed
-	case <-c.Open():
+	case <-p.Closed():
+		return ErrPeerClosed
+	case <-p.Open():
 		return nil
 	}
 }
 
-func (c *PeerConnection) Listen(ctx context.Context, signaller ListenSignaller) error {
+func (p *Peer) Listen(ctx context.Context, signaller ListenSignaller) error {
 	offer, err := signaller.PullOffer(ctx)
 	if err != nil {
 		return err
 	}
 
-	answer, err := c.AcceptOfferAndCreateAnswer(ctx, offer)
+	answer, err := p.AcceptOfferAndCreateAnswer(ctx, offer)
 	if err != nil {
 		return err
 	}
@@ -370,38 +370,38 @@ func (c *PeerConnection) Listen(ctx context.Context, signaller ListenSignaller) 
 	}
 
 	go func() {
-		if err := c.PullAndAddICECandidates(ctx, signaller.RequestICECandidate); err != nil {
-			c.Close()
+		if err := p.PullAndAddICECandidates(ctx, signaller.RequestICECandidate); err != nil {
+			p.Close()
 		}
 	}()
 
 	select {
-	case <-c.Closed():
-		return ErrPeerConnectionClosed
-	case <-c.Open():
+	case <-p.Closed():
+		return ErrPeerClosed
+	case <-p.Open():
 		return nil
 	}
 }
 
-func (c *PeerConnection) Open() SignalChan {
-	return c.DataChannel.Open()
+func (p *Peer) Open() SignalChan {
+	return p.DataChannel.Open()
 }
 
-func (c *PeerConnection) Closed() SignalChan {
-	return c.closedChan
+func (p *Peer) Closed() SignalChan {
+	return p.closedChan
 }
 
-func (c *PeerConnection) Close() error {
-	c.closedMtx.Lock()
+func (p *Peer) Close() error {
+	p.closedMtx.Lock()
 
-	if c.closed {
-		c.closedMtx.Unlock()
+	if p.closed {
+		p.closedMtx.Unlock()
 		return nil
 	}
 
-	c.closed = true
-	c.closedMtx.Unlock()
+	p.closed = true
+	p.closedMtx.Unlock()
 
-	close(c.closedChan)
+	close(p.closedChan)
 	return nil
 }

@@ -13,20 +13,20 @@ import (
 ////////////////////////////////////////////////////////////////////////
 
 type LocalDialSignaller struct {
-	localPeerConnection  *PeerConnection
-	remotePeerConnection *PeerConnection
-	offerChan            chan interface{}
-	answerChan           chan interface{}
+	localPeer  *Peer
+	remotePeer *Peer
+	offerChan  chan interface{}
+	answerChan chan interface{}
 }
 
 type LocalListenSignaller struct {
-	localPeerConnection  *PeerConnection
-	remotePeerConnection *PeerConnection
-	offerChan            chan interface{}
-	answerChan           chan interface{}
+	localPeer  *Peer
+	remotePeer *Peer
+	offerChan  chan interface{}
+	answerChan chan interface{}
 }
 
-func NewLocalSignallers(a, b *PeerConnection) (*LocalDialSignaller, *LocalListenSignaller) {
+func NewLocalSignallers(a, b *Peer) (*LocalDialSignaller, *LocalListenSignaller) {
 	offerChan := make(chan interface{})
 	answerChan := make(chan interface{})
 	dialSignaller := &LocalDialSignaller{a, b, offerChan, answerChan}
@@ -71,11 +71,11 @@ func (s *LocalDialSignaller) PullAnswer(ctx context.Context) (interface{}, error
 }
 
 func (s *LocalDialSignaller) RequestICECandidate(ctx context.Context) (interface{}, error) {
-	return s.remotePeerConnection.WaitForICECandidate(ctx)
+	return s.remotePeer.WaitForICECandidate(ctx)
 }
 
 func (s *LocalListenSignaller) RequestICECandidate(ctx context.Context) (interface{}, error) {
-	return s.remotePeerConnection.WaitForICECandidate(ctx)
+	return s.remotePeer.WaitForICECandidate(ctx)
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -85,12 +85,12 @@ func (s *LocalListenSignaller) RequestICECandidate(ctx context.Context) (interfa
 func main() {
 	ctx := context.Background()
 
-	c1, err := NewPeerConnection(ctx)
+	c1, err := NewPeer(ctx)
 	if err != nil {
 		panic(err)
 	}
 
-	c2, err := NewPeerConnection(ctx)
+	c2, err := NewPeer(ctx)
 	if err != nil {
 		panic(err)
 	}
@@ -104,7 +104,7 @@ func main() {
 
 		transferred := 0
 		buf := make([]byte, 1024*1024)
-		for {
+		for transferred < 16*1024*10000 {
 			n, err := c2.DataChannel.Read(buf)
 			if err != nil {
 				if err == ErrWebConnClosed {
@@ -115,6 +115,8 @@ func main() {
 			transferred += n
 			log.Printf("Read bytes (%d) and total bytes (%d) with error (%v)", n, transferred, err)
 		}
+
+		c2.DataChannel.Write([]byte("OKOK"))
 	}()
 
 	if err := c1.Dial(ctx, dialSignaller); err != nil {
@@ -134,5 +136,13 @@ func main() {
 
 	n, err := c1.DataChannel.Write(dest.Bytes())
 	log.Printf("Written bytes (%d) with error (%v)", n, err)
+
+	buf := make([]byte, 4)
+	if _, err := c1.DataChannel.Read(buf); err != nil {
+		panic(err)
+	}
+
+	log.Print(string(buf))
+
 	c1.Close()
 }
